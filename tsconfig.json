@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "es2021",
+    // node16 is required to resolve the @inco/lightning-js "exports" subpaths.
+    // The repo has no "type": "module", so this still emits CommonJS for ts-node.
+    "module": "node16",
+    "moduleResolution": "node16",
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "outDir": "dist"
+  },
+  "include": ["./scripts", "./test", "./hardhat.config.ts"]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "holecard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Blackjack where every card is a live Megapot lottery ticket and the dealer hole card lives in Inco encrypted state",
+  "scripts": {
+    "compile": "hardhat compile",
+    "smoke:mainnet": "hardhat run scripts/smokeInco.ts --network base"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.26.0",
+    "dotenv": "^16.4.5",
+    "typescript": "5.8.3",
+    "ts-node": "10.9.2"
+  },
+  "overrides": {
+    "typescript": "5.8.3"
+  },
+  "dependencies": {
+    "@inco/lightning": "1.0.2",
+    "@inco/lightning-js": "1.0.2"
+  }
+}
