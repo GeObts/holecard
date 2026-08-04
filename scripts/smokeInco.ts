@@ -14,18 +14,53 @@ import { ethers } from "hardhat";
 import { Lightning } from "@inco/lightning-js/lite";
 
 const EXPECTED_CHAIN_ID = 8453n;
+const INCO_EXECUTOR = "0x4b9911b0191B0b6a6eA8F2Ed562e20Cff5AC8624";
 
-// The SDK opens its own RPC connection. The public endpoint 429s, so give it a
-// fallback list. Set BASE_RPC_URL to a dedicated provider to put it first.
+// The SDK opens its own RPC connection. Set BASE_RPC_URL to the Alchemy endpoint.
+// publicnode is the single fallback. mainnet.base.org is deliberately absent: it
+// throttles silently and caches failures for 24 hours. llamarpc was returning 521.
 const RPC_URLS: string[] = [
   ...(process.env.BASE_RPC_URL ? [process.env.BASE_RPC_URL] : []),
   "https://base-rpc.publicnode.com",
-  "https://base.llamarpc.com",
-  "https://mainnet.base.org",
 ];
 
 function line() {
   console.log("-".repeat(72));
+}
+
+/**
+ * Public RPC endpoints are load balanced. waitForDeployment can be satisfied by
+ * one node while the next eth_call is routed to another that has not caught up,
+ * which returns 0x and decodes as BAD_DATA. Poll until the code is visible.
+ */
+async function waitForCode(addr: string, tries = 30): Promise<void> {
+  for (let i = 0; i < tries; i++) {
+    if ((await ethers.provider.getCode(addr)) !== "0x") return;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error(`No code at ${addr} after ${tries} tries. RPC may be lagging.`);
+}
+
+/**
+ * Pull the card handle out of the Drawn event in the transaction receipt.
+ *
+ * Do NOT read it back from contract state. The receipt is authoritative and needs
+ * no extra round trip, whereas a state read straight after the write can be routed
+ * to a node one block behind and silently return the zero value.
+ */
+function handleFromReceipt(contract: any, rcpt: any): `0x${string}` {
+  for (const log of rcpt.logs) {
+    try {
+      const parsed = contract.interface.parseLog({
+        topics: [...log.topics],
+        data: log.data,
+      });
+      if (parsed?.name === "Drawn") return parsed.args[0] as `0x${string}`;
+    } catch {
+      // Logs from the Inco executor are in the same receipt and will not parse.
+    }
+  }
+  throw new Error("No Drawn event in receipt");
 }
 
 async function main() {
@@ -53,27 +88,54 @@ async function main() {
     throw new Error("Deployer has no ETH. Fund it before running the gate.");
   }
 
-  // 1. Deploy
+  // 1. Deploy, or reuse an existing deployment to avoid paying gas twice
   line();
-  console.log("Deploying IncoSmoke...");
-  const factory = await ethers.getContractFactory("IncoSmoke");
-  const smoke = await factory.deploy();
-  await smoke.waitForDeployment();
-  const smokeAddress = await smoke.getAddress();
-  const deployTx = smoke.deploymentTransaction();
-  const deployRcpt = deployTx ? await deployTx.wait() : null;
-  console.log("IncoSmoke deployed at:", smokeAddress);
-  console.log("deploy gas used     :", deployRcpt?.gasUsed?.toString() ?? "unknown");
+  const existing = process.env.SMOKE_ADDRESS;
+  let smoke;
+  let smokeAddress: string;
 
-  // 2. Read the live fee rather than trusting the constant in the source
-  const fee: bigint = await smoke.incoFee();
+  if (existing) {
+    console.log("Reusing existing IncoSmoke at:", existing);
+    await waitForCode(existing);
+    smoke = await ethers.getContractAt("IncoSmoke", existing);
+    smokeAddress = existing;
+    const bal = await ethers.provider.getBalance(smokeAddress);
+    console.log("contract balance    :", ethers.formatEther(bal), "ETH");
+  } else {
+    console.log("Deploying IncoSmoke...");
+    const factory = await ethers.getContractFactory("IncoSmoke");
+    smoke = await factory.deploy();
+    await smoke.waitForDeployment();
+    smokeAddress = await smoke.getAddress();
+    const deployTx = smoke.deploymentTransaction();
+    const deployRcpt = deployTx ? await deployTx.wait() : null;
+    console.log("IncoSmoke deployed at:", smokeAddress);
+    console.log("deploy gas used     :", deployRcpt?.gasUsed?.toString() ?? "unknown");
+    await waitForCode(smokeAddress);
+  }
+
+  // 2. Read the live fee from the Inco executor directly. The fee belongs to Inco,
+  //    so routing the read through our own contract only adds a dependency.
+  const incoRead = new ethers.Contract(
+    INCO_EXECUTOR,
+    ["function getFee() pure returns (uint256)"],
+    ethers.provider
+  );
+  const fee: bigint = await incoRead.getFee();
   console.log("live inco fee per op:", ethers.formatEther(fee), "ETH");
 
   // 3. Fund the contract. randBounded pays the fee from contract balance.
-  const funding = fee * 100n;
-  console.log("funding contract    :", ethers.formatEther(funding), "ETH (100 ops)");
-  const fundTx = await deployer.sendTransaction({ to: smokeAddress, value: funding });
-  await fundTx.wait();
+  //    Only top up if it cannot already cover the draws this run makes.
+  const needed = fee * 10n;
+  const current = await ethers.provider.getBalance(smokeAddress);
+  if (current < needed) {
+    const funding = fee * 100n;
+    console.log("funding contract    :", ethers.formatEther(funding), "ETH (100 ops)");
+    const fundTx = await deployer.sendTransaction({ to: smokeAddress, value: funding });
+    await fundTx.wait();
+  } else {
+    console.log("funding contract    : already funded, skipping");
+  }
 
   // 4. Draw a card and reveal it
   line();
@@ -84,7 +146,7 @@ async function main() {
   console.log("draw gas used       :", drawRcpt.gasUsed.toString());
   console.log("tx hash             :", drawRcpt.hash);
 
-  const revealedHandle: string = await smoke.lastHandle();
+  const revealedHandle = handleFromReceipt(smoke, drawRcpt);
   console.log("revealed handle     :", revealedHandle);
 
   // 5. Ask the covalidator for the plaintext
@@ -98,7 +160,7 @@ async function main() {
 
   console.log("Requesting attestedReveal (covalidator is async, this retries)...");
   const t0 = Date.now();
-  const attestations = await lightning.attestedReveal([revealedHandle as `0x${string}`]);
+  const attestations = await lightning.attestedReveal([revealedHandle]);
   const elapsed = Date.now() - t0;
 
   const value = attestations[0]?.plaintext?.value;
@@ -120,15 +182,16 @@ async function main() {
   line();
   console.log("Calling drawSecret() (no grant, no reveal)...");
   const secretTx = await smoke.drawSecret();
-  await secretTx.wait();
-  const secretHandle: string = await smoke.lastHandle();
+  const secretRcpt = await secretTx.wait();
+  if (!secretRcpt) throw new Error("No receipt for drawSecret");
+  const secretHandle = handleFromReceipt(smoke, secretRcpt);
   console.log("secret handle       :", secretHandle);
   console.log("Attempting attestedReveal on the ungranted handle...");
 
   let secretLeaked = false;
   let secretValue: unknown = undefined;
   try {
-    const secretAtt = await lightning.attestedReveal([secretHandle as `0x${string}`], {
+    const secretAtt = await lightning.attestedReveal([secretHandle], {
       backoffConfig: { maxRetries: 2 },
     });
     secretValue = secretAtt[0]?.plaintext?.value;

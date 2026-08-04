@@ -17,13 +17,13 @@ const INCO_VERIFIER = "0x867758FFe098fB0D74826A8DCf60127696440f09";
 const MEGAPOT_JACKPOT = "0x3bAe643002069dBCbcd62B1A4eb4C4A397d042a2";
 const MEGAPOT_TICKET_NFT = "0x48FfE35AbB9f4780a4f1775C2Ce1c46185b366e4";
 
-// viem tries these in order on failure. Set BASE_RPC_URL to a dedicated provider
-// to put it first. The public endpoints rate limit hard under any real load.
+// viem tries these in order on failure. BASE_RPC_URL is the Alchemy endpoint and
+// goes first. publicnode is the single fallback. mainnet.base.org is deliberately
+// absent: it throttles silently and caches failures for 24 hours, which is worse
+// than a hard error. llamarpc was returning 521 and is removed.
 const RPC_URLS: string[] = [
   ...(process.env.BASE_RPC_URL ? [process.env.BASE_RPC_URL] : []),
   "https://base-rpc.publicnode.com",
-  "https://base.llamarpc.com",
-  "https://mainnet.base.org",
 ];
 
 function line() {
