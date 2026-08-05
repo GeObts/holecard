@@ -49,7 +49,10 @@ describe("TicketVault (fork)", () => {
     await (await usdc.transfer(player.address, 50n * ONE_USDC)).wait();
 
     return {
-      vault,
+      // typechain loses the contract type through .connect(signer), which turns
+      // every call site into a BaseContract error under tsc even though hardhat
+      // transpiles and runs it fine. Cast once here rather than at 24 call sites.
+      vault: vault as any,
       owner,
       treasury,
       table,
@@ -286,7 +289,7 @@ describe("TicketVault canBuy branches (mock)", () => {
     );
     await vault.waitForDeployment();
     await (await vault.setTable(table.address)).wait();
-    return { vault, mock, owner };
+    return { vault: vault as any, mock, owner };
   }
 
   it("is true when all four conditions hold", async () => {
