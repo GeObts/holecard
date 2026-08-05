@@ -5,3 +5,10 @@ typechain-types/
 .env
 .env.local
 *.bak-*
+
+# Editor swap files. A vim swap of .env reached the history once already.
+*.swp
+*.swo
+*~
+.*.sw?
+
