@@ -71,7 +71,12 @@ contract TicketVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
 
     /// @notice Buying and selling both stop this many seconds before the drawing.
     /// @dev Sized to the longest plausible hand so no hand opens that cannot finish.
-    uint256 public closeBufferSeconds = 900;
+    ///      DELIBERATELY UNRESOLVED at 10 minutes. Sizing this properly needs a
+    ///      measured worst-case hand end to end (deal, four hits, dealer draws,
+    ///      resolve, including attestation round trips under load), which is a
+    ///      Phase C measurement. Guessing from the 4.4s idle attestation latency
+    ///      would mean guessing twice.
+    uint256 public closeBufferSeconds = 600;
 
     /// @notice The BlackjackTable. Only it may move house funds or tickets.
     address public table;

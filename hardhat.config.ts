@@ -29,6 +29,15 @@ const config: HardhatUserConfig = {
     },
   },
   networks: {
+    // Forked Base mainnet for TicketVault integration tests. The block is pinned
+    // so results are reproducible: drawing 134 is open here with roughly 23 hours
+    // to its drawingTime, so canBuy() is true at the start of every test.
+    hardhat: {
+      forking: {
+        url: BASE_RPC_URL,
+        blockNumber: 49550200,
+      },
+    },
     // Base mainnet. Megapot V2 and Inco Lightning both live here.
     base: {
       url: BASE_RPC_URL,
