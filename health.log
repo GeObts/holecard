@@ -1,0 +1,6 @@
+2026-08-06T00:29:03.547Z verdict=DOWN serving=FAIL/30.0s/6 ingestion=FAIL/90.0s/18 handle=0x3503de50b94cd2a80357959cf965d820e07536c01aa338e9ea33dc7daaf10800
+2026-08-06T00:31:30.762Z verdict=DOWN serving=FAIL/30.0s/6 ingestion=FAIL/90.0s/18 handle=0x49de74b2e7cf264012eeddb5beb97fb50a6dc3ea4441e178479be5f134450800
+2026-08-06T00:32:13Z verdict=SKIPPED reason=previous_run_still_active
+2026-08-06T00:32:16.206Z verdict=DOWN serving=FAIL/30.0s/6 ingestion=FAIL/90.0s/18 handle=0x0e02d41f31c03417f7f278cbfa1e0576e5c287cb706a8e997d3f554d282e0800
+2026-08-06T00:34:37.872Z verdict=DOWN serving=FAIL/30.0s/6 ingestion=FAIL/90.0s/18 handle=0xb0caa4cbaa0b686336dbfe7e784ab18fba7be94a0ab179b46f39851f94f90800
+2026-08-06T00:34:37.872Z verdict=DOWN serving=FAIL/30.0s/6 ingestion=FAIL/90.0s/18 handle=0xb0caa4cbaa0b686336dbfe7e784ab18fba7be94a0ab179b46f39851f94f90800

@@ -12,3 +12,6 @@ typechain-types/
 *~
 .*.sw?
 
+# Uptime probe output. Local operational data, not source.
+health.log
+.health.lock

@@ -17,8 +17,28 @@
  *
  * Run: npx hardhat run scripts/covalidatorHealth.ts --network base
  */
+import { appendFileSync } from "fs";
 import { ethers } from "hardhat";
 import { Lightning } from "@inco/lightning-js/lite";
+
+/**
+ * Append-only health log. Serving and ingestion are recorded separately so their
+ * recovery can be seen independently, which is exactly how they failed.
+ */
+const HEALTH_LOG = process.env.HEALTH_LOG ?? "";
+
+function logLine(fields: string) {
+  const stamp = new Date().toISOString();
+  const row = `${stamp} ${fields}\n`;
+  process.stdout.write(row);
+  if (HEALTH_LOG) {
+    try {
+      appendFileSync(HEALTH_LOG, row);
+    } catch (e) {
+      process.stderr.write(`could not append to ${HEALTH_LOG}: ${(e as Error).message}\n`);
+    }
+  }
+}
 
 /** Revealed and read successfully as 31 on 2026-08-04. */
 const KNOWN_GOOD = "0x8deb8171633631303b67894d9507052237ca1b26efd7aa88a63b514e8f940800";
@@ -109,11 +129,20 @@ async function main() {
 
   // -------------------------------------------------------------- 3. VERDICT
   line();
-  if (servingOk && ingestionOk) {
+  const verdict = servingOk && ingestionOk ? "HEALTHY" : servingOk ? "INGESTION_DOWN" : "DOWN";
+
+  logLine(
+    `verdict=${verdict} ` +
+      `serving=${servingOk ? "PASS" : "FAIL"}/${serving.seconds.toFixed(1)}s/${serving.attempts} ` +
+      `ingestion=${ingestionOk ? "PASS" : "FAIL"}/${ingestion.seconds.toFixed(1)}s/${ingestion.attempts} ` +
+      `handle=${handle}`
+  );
+
+  if (verdict === "HEALTHY") {
     console.log("VERDICT: HEALTHY. Hands can resolve. Safe to record the demo.");
     return;
   }
-  if (servingOk && !ingestionOk) {
+  if (verdict === "INGESTION_DOWN") {
     console.log("VERDICT: INGESTION DOWN, serving fine.");
     console.log("No hand can resolve. Do NOT record. This is the 2026-08-05 failure mode.");
   } else {
