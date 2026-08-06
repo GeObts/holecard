@@ -62,6 +62,12 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
     ///      this fires. 300 against the vault's 600 leaves 300s of runway.
     uint256 public pushDeadlineSeconds = 300;
 
+    /// @notice Idle time before an abandoned hand can be force-stood.
+    /// @dev 30 minutes. Generous for a human deciding whether to hit, short
+    ///      enough that a walked-away hand does not hold vault tickets and
+    ///      reserved USDC for the rest of the round.
+    uint256 public turnTimeoutSeconds = 1800;
+
     // -------------------------------------------------------------------- types
 
     enum State {
@@ -75,7 +81,12 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
         address player;
         State state;
         uint64 openedAt;
+        uint64 lastActionAt;
         uint64 stoodAt;
+        /// @dev Which Megapot drawing this hand's tickets belong to. Tickets are
+        ///      bound to a drawing and worth nothing after it, so a hand must not
+        ///      be allowed to straddle the boundary silently.
+        uint64 drawingId;
         bool doubled;
         euint256[] playerCards;
         euint256 dealerUp;
@@ -108,7 +119,8 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
     event KeeperSet(address indexed previous, address indexed current);
     event HitSoft17Set(bool value);
     event HandTimedOut(uint256 indexed handId, address indexed player, uint256 ticketsReturned, uint256 usdcPaid);
-    event TimeoutParamsSet(uint256 attestationTimeout, uint256 pushDeadline);
+    event HandForceStood(uint256 indexed handId, address indexed player, address indexed by);
+    event TimeoutParamsSet(uint256 attestationTimeout, uint256 pushDeadline, uint256 turnTimeout);
 
     // ------------------------------------------------------------------- errors
 
@@ -121,8 +133,9 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
     error BuyingClosed();
     error BadAttestation(uint256 index);
     error AttestationCountMismatch(uint256 expected, uint256 provided);
-    error DoubleNotAllowed();
+    error DoubleAfterHit();
     error AlreadyDoubled();
+    error TurnNotExpired(uint256 deadline);
 
     // -------------------------------------------------------------- construction
 
@@ -208,6 +221,8 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
         h.player = msg.sender;
         h.state = State.PlayerTurn;
         h.openedAt = uint64(block.timestamp);
+        h.lastActionAt = uint64(block.timestamp);
+        h.drawingId = uint64(jackpot.currentDrawingId());
 
         uint256[] memory ids = vault.buyTickets(_makeTickets(4, _seed(handId, 0)), 0);
         for (uint256 i = 0; i < ids.length; i++) h.potTickets.push(ids[i]);
@@ -233,14 +248,30 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Double: pay two, take exactly one card, then stand.
-    /// @dev Hard 9, 10 or 11 only. The contract cannot read the total during play,
-    ///      so eligibility is asserted by the caller and verified at settle. A
-    ///      player who doubles on an ineligible hand has the double rejected there.
+    ///
+    /// @dev Allowed on ANY two cards. The hard 9/10/11 restriction in the original
+    ///      spec is deliberately dropped.
+    ///
+    ///      It was there as a house-edge lever and the edge no longer needs it:
+    ///      6:5 naturals, S17 and the infinite shoe already provide it. Enforcing
+    ///      it would mean checking the total at settle, long after the player
+    ///      acted, and then either voiding the hand or silently reclassifying the
+    ///      double as a hit. Reclassifying produces a hand the player never played,
+    ///      which reads as the house rewriting outcomes under audit.
+    ///
+    ///      Doubling on a soft 13 is simply a bad bet. The house edge does not
+    ///      need protecting from players making mistakes, and "double on any two
+    ///      cards" is a published rule variant, not an invention.
+    ///
+    ///      The one restriction that stays is first-two-cards-only, which is the
+    ///      universal rule and is checkable without reading any card value.
     function double() external nonReentrant {
         (uint256 handId, Hand storage h) = _openHand();
         if (h.state != State.PlayerTurn) revert WrongState();
         if (h.doubled) revert AlreadyDoubled();
-        if (h.playerCards.length != 2) revert DoubleNotAllowed();
+        // First two cards only. Universal rule, and checkable without reading a
+        // card value, unlike a total-based restriction.
+        if (h.playerCards.length != 2) revert DoubleAfterHit();
 
         // One extra card, plus a second ticket that is pure added stake.
         _takeOneCard(handId, h);
@@ -262,6 +293,7 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
         );
         h.potTickets.push(ids[0]);
         h.playerCards.push(_drawFaceUp());
+        h.lastActionAt = uint64(block.timestamp);
 
         // The house owes a matching ticket. Purchase deferred to resolve, funding
         // is not: reserve it now or the vault can go insolvent on a run of hits.
@@ -391,6 +423,54 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
             if (!e.verifyDecryption(h.dealerDraws[i], values[k], sigs[k])) revert BadAttestation(k);
             draws[i] = values[k];
         }
+    }
+
+    // ----------------------------------------------------------- round lifecycle
+
+    /// @notice When a hand sitting in PlayerTurn can be force-stood. Zero if not applicable.
+    ///
+    /// @dev The table follows the Megapot drawing. Hands open when the round is
+    ///      open and every hand must finish before the drawing fires, because its
+    ///      tickets are worth nothing afterwards.
+    ///
+    ///      Two deadlines, whichever is earlier:
+    ///        lastActionAt + turnTimeout      the player walked away mid-hand
+    ///        drawingTime - closeBuffer       the round closed under them
+    ///
+    ///      The second is the hard close from the spec. It is the same instant
+    ///      canBuy() goes false, so a hand can never sit in PlayerTurn while the
+    ///      table is shut.
+    function forceStandAt(uint256 handId) public view returns (uint256) {
+        Hand storage h = _hands[handId];
+        if (h.state != State.PlayerTurn) return 0;
+
+        uint256 byIdle = uint256(h.lastActionAt) + turnTimeoutSeconds;
+        uint256 closeBuffer = vault.closeBufferSeconds();
+        uint256 drawingTime = jackpot.getDrawingState(jackpot.currentDrawingId()).drawingTime;
+        uint256 byRound = drawingTime > closeBuffer ? drawingTime - closeBuffer : 0;
+
+        return byIdle < byRound ? byIdle : byRound;
+    }
+
+    /// @notice Force an abandoned hand to stand. Permissionless.
+    ///
+    /// @dev This is the force-resolve sweep. It resolves ON MERITS: standing is a
+    ///      legal move, so a player who walks away gets exactly the outcome they
+    ///      would have had by clicking stand. There is nothing to escape, so there
+    ///      is nothing to deter, and no punitive seizure that could not tell an
+    ///      abandoner apart from someone who is merely slow.
+    ///
+    ///      Works even once canBuy() is false: standing commits dealer draws,
+    ///      which costs Inco fees but buys no tickets.
+    function forceStand(uint256 handId) external nonReentrant {
+        Hand storage h = _hands[handId];
+        if (h.state != State.PlayerTurn) revert WrongState();
+
+        uint256 deadline = forceStandAt(handId);
+        if (deadline == 0 || block.timestamp < deadline) revert TurnNotExpired(deadline);
+
+        emit HandForceStood(handId, h.player, msg.sender);
+        _stand(handId, h);
     }
 
     // ------------------------------------------------------------------ timeout
@@ -565,11 +645,29 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
             bool doubled,
             uint256 playerCardCount,
             uint256 potTickets,
-            uint256 houseOwedTickets
+            uint256 houseOwedTickets,
+            uint64 drawingId
         )
     {
         Hand storage h = _hands[handId];
-        return (h.player, h.state, h.doubled, h.playerCards.length, _potSize(h), h.houseOwedTickets);
+        return (
+            h.player,
+            h.state,
+            h.doubled,
+            h.playerCards.length,
+            _potSize(h),
+            h.houseOwedTickets,
+            h.drawingId
+        );
+    }
+
+    /// @notice True when this hand's tickets belong to a drawing that has moved on.
+    /// @dev The UI needs this: a hand whose round has rolled cannot be paid in
+    ///      tickets, only in USDC, and the player should be told before they act.
+    function isStale(uint256 handId) external view returns (bool) {
+        Hand storage h = _hands[handId];
+        if (h.state == State.None || h.state == State.Settled) return false;
+        return h.drawingId != uint64(jackpot.currentDrawingId());
     }
 
     /// @notice Handles the frontend needs to decrypt or reveal.
@@ -612,12 +710,17 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
     /// @dev pushDeadline must stay under the vault's closeBufferSeconds, else a
     ///      hand could open after the point where stuck hands are already being
     ///      pushed, which would let a hand exist with no route to resolution.
-    function setTimeoutParams(uint256 attestationTimeout, uint256 pushDeadline) external onlyOwner {
+    function setTimeoutParams(
+        uint256 attestationTimeout,
+        uint256 pushDeadline,
+        uint256 turnTimeout
+    ) external onlyOwner {
         uint256 closeBuffer = vault.closeBufferSeconds();
         if (pushDeadline >= closeBuffer) revert PushDeadlineTooLarge(pushDeadline, closeBuffer);
         attestationTimeoutSeconds = attestationTimeout;
         pushDeadlineSeconds = pushDeadline;
-        emit TimeoutParamsSet(attestationTimeout, pushDeadline);
+        turnTimeoutSeconds = turnTimeout;
+        emit TimeoutParamsSet(attestationTimeout, pushDeadline, turnTimeout);
     }
 
     // ----------------------------------------------------------------- internal

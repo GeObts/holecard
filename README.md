@@ -14,6 +14,26 @@ Because every card costs a dollar, hitting is never free. **This is blackjack wh
 
 The dealer's hole card is drawn as an Inco encrypted handle with no access grant issued to anyone. Its ticket numbers are public, because NFT state is public. Its face is not. You can see the dealer's lucky numbers all game. You just cannot see what card it is.
 
+## House rules
+
+The rules the contract actually enforces. Nothing here is aspirational.
+
+| Rule | Setting |
+|---|---|
+| Deck | Infinite shoe, drawn with replacement from Inco encrypted randomness |
+| Natural blackjack | Pays 6:5, two cards only. A three-card 21 is a plain win |
+| Dealer on soft 17 | Stands (S17). `hitSoft17` exists and is off |
+| Doubling | Any two cards. No total restriction |
+| Double after hit | Not allowed |
+| Splitting | Not offered |
+| Insurance | Not offered |
+| Late surrender | Not offered |
+| Push | Each side keeps its own |
+| Busting | Permitted after a bust. It only costs the player more on a hand they have already lost |
+| Abandoned hands | Force-stood, then resolved on merits. The house never seizes a pot |
+
+On doubling: the original spec restricted it to hard 9, 10 and 11 as a house-edge lever. That was dropped. Enforcing it would mean reading the player's total at settle, long after they acted, and then either voiding the hand or reclassifying the double as a hit, which produces a hand the player never played. The edge is already carried by 6:5, S17 and the infinite shoe. Doubling on a soft 13 is simply a bad bet, and the house does not need protecting from that.
+
 ## Status
 
 Foundations are proven against live Base mainnet. Game logic and frontend are in progress.
@@ -24,8 +44,12 @@ Foundations are proven against live Base mainnet. Game logic and frontend are in
 | Megapot purchase, tagging, transfer | Verified live |
 | `TicketVault` | Built, 17 fork tests passing |
 | `TicketMath` live EV | Built, unit tested |
-| `BlackjackTable` | Not started |
+| `BlackjackTable` | Built, compiling. Hand lifecycle, timeouts, payouts |
+| `BlackjackMath` | Built, 34 plaintext rule tests |
+| Hole card proof | Written, blocked on the Inco covalidator |
 | Frontend | Not started |
+
+**58 tests pass with no covalidator, no fork and no Docker.** Every game rule is provable on plaintext cards, so the rules can be demonstrated even while the attestation service is unavailable.
 
 ## Verified on-chain facts
 
