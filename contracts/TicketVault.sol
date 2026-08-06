@@ -101,6 +101,7 @@ contract TicketVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
     event Reserved(uint256 amount, uint256 totalReserved);
     event Unreserved(uint256 amount, uint256 totalReserved);
     event SettledInUsdc(address indexed to, uint256 ticketsOwed, uint256 amountUsdc);
+    event RemainderPaid(address indexed to, uint256 amountUsdc);
     event SoldBack(address indexed from, uint256 count, uint256 amountUsdc);
     event BankrollDeposited(address indexed from, uint256 amount);
     event BankrollWithdrawn(address indexed to, uint256 amount);
@@ -291,6 +292,19 @@ contract TicketVault is Ownable2Step, ReentrancyGuard, IERC721Receiver {
         _unreserve(amount > reservedUsdc ? reservedUsdc : amount);
         usdc.safeTransfer(to, amount);
         emit SettledInUsdc(to, ticketsOwed, amount);
+    }
+
+    /// @notice Pay a raw USDC amount to a player.
+    /// @dev Used for the fractional remainder on a 6:5 natural, where the payout
+    ///      is not a whole number of indivisible tickets. Drawn from free bankroll,
+    ///      never from another hand's reserve.
+    function payUsdc(address to, uint256 amount) external onlyTable nonReentrant {
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) return;
+        uint256 free = freeUsdc();
+        if (amount > free) revert InsufficientFreeBalance(amount, free);
+        usdc.safeTransfer(to, amount);
+        emit RemainderPaid(to, amount);
     }
 
     // ------------------------------------------------------------------ sellback

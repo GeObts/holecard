@@ -57,6 +57,33 @@ library TicketMath {
         return acc / total;
     }
 
+    /// @notice Split a fractional ticket payout into whole tickets plus a USDC remainder.
+    ///
+    /// @dev Ticket NFTs are indivisible, so any payout that is not a whole number
+    ///      has to settle the fraction in cash. This is the single shared helper
+    ///      the spec calls for: it is NOT a special case for 6:5 naturals, and any
+    ///      future fractional rule uses it unchanged.
+    ///
+    ///      Worked example, a 2-card natural at 6:5. The player staked 2 tickets,
+    ///      so winnings are 2 * 6/5 = 2.4 tickets. They already receive their own
+    ///      2 back plus the house's 2 from the pot, which covers 2 of those. The
+    ///      outstanding 0.4 is what this splits: numerator 2, denominator 5, giving
+    ///      0 whole tickets and 400000 (that is $0.40) in USDC.
+    ///
+    /// @param numerator     fractional ticket count, scaled by `denominator`
+    /// @param denominator   must be non-zero
+    /// @param unitPriceUsdc live ticket price, never hardcoded
+    function splitFractional(
+        uint256 numerator,
+        uint256 denominator,
+        uint256 unitPriceUsdc
+    ) internal pure returns (uint256 wholeTickets, uint256 usdcRemainder) {
+        if (denominator == 0) revert InvalidBallBounds();
+        wholeTickets = numerator / denominator;
+        // Multiply before dividing so the remainder keeps full USDC precision.
+        usdcRemainder = ((numerator % denominator) * unitPriceUsdc) / denominator;
+    }
+
     /// @notice What a ticket is worth to whoever holds it, in USDC 6dp.
     /// @dev The referrer's win share is taken out of winnings at claim time, so the
     ///      holder never sees it. This is the number that matters when pricing a

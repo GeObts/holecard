@@ -10,6 +10,7 @@ import {euint256, e, inco} from "@inco/lightning/src/Lib.sol";
 import {IJackpot} from "./interfaces/IMegapot.sol";
 import {TicketVault} from "./TicketVault.sol";
 import {BlackjackMath} from "./lib/BlackjackMath.sol";
+import {TicketMath} from "./lib/TicketMath.sol";
 
 /// @title BlackjackTable
 /// @notice Blackjack where every card is a live Megapot ticket and the dealer's
@@ -45,12 +46,21 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
     /// @notice Dormant. S17 ships. Flipping this is the whole H17 change.
     bool public hitSoft17 = false;
 
-    /// @notice Keeper permitted to submit settle on a player's behalf.
-    /// @dev Settle carries self-authenticating attestations bound to stored
-    ///      handles, so a keeper cannot substitute values. The player can always
-    ///      submit it themselves, so a keeper outage degrades to one more prompt
-    ///      rather than stranding the hand.
+    /// @notice Keeper we run to submit settle so players do not have to.
+    /// @dev Convenience only, NOT access control. settle is permissionless.
+    ///      Recorded here purely so our own monitoring can find it.
     address public keeper;
+
+    /// @notice How long after standing before a hand can be force-pushed.
+    /// @dev 300s is roughly 68x the 4.4s attestation latency measured on a
+    ///      healthy covalidator.
+    uint256 public attestationTimeoutSeconds = 300;
+
+    /// @notice How far before the drawing a stuck hand must be pushed.
+    /// @dev MUST stay below the vault's closeBufferSeconds, so a hand that opens
+    ///      at the last permitted moment still has room to settle normally before
+    ///      this fires. 300 against the vault's 600 leaves 300s of runway.
+    uint256 public pushDeadlineSeconds = 300;
 
     // -------------------------------------------------------------------- types
 
@@ -65,6 +75,7 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
         address player;
         State state;
         uint64 openedAt;
+        uint64 stoodAt;
         bool doubled;
         euint256[] playerCards;
         euint256 dealerUp;
@@ -96,6 +107,8 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
     );
     event KeeperSet(address indexed previous, address indexed current);
     event HitSoft17Set(bool value);
+    event HandTimedOut(uint256 indexed handId, address indexed player, uint256 ticketsReturned, uint256 usdcPaid);
+    event TimeoutParamsSet(uint256 attestationTimeout, uint256 pushDeadline);
 
     // ------------------------------------------------------------------- errors
 
@@ -103,7 +116,8 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
     error HandAlreadyOpen();
     error NoOpenHand();
     error WrongState();
-    error NotPlayerOrKeeper();
+    error TimeoutNotReached(uint256 deadline);
+    error PushDeadlineTooLarge(uint256 pushDeadline, uint256 closeBuffer);
     error BuyingClosed();
     error BadAttestation(uint256 index);
     error AttestationCountMismatch(uint256 expected, uint256 provided);
@@ -283,6 +297,7 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
         }
 
         h.state = State.AwaitingAttestation;
+        h.stoodAt = uint64(block.timestamp);
         emit PlayerStood(handId, h.dealerDraws.length);
     }
 
@@ -302,39 +317,21 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
     {
         Hand storage h = _hands[handId];
         if (h.state != State.AwaitingAttestation) revert WrongState();
-        if (msg.sender != h.player && msg.sender != keeper) revert NotPlayerOrKeeper();
 
-        uint256 pLen = h.playerCards.length;
-        uint256 expected = pLen + 2 + h.dealerDraws.length;
-        if (values.length != expected || sigs.length != expected) {
-            revert AttestationCountMismatch(expected, values.length);
-        }
-
-        uint256[] memory playerCards = new uint256[](pLen);
-        for (uint256 i = 0; i < pLen; i++) {
-            if (!e.verifyDecryption(h.playerCards[i], values[i], sigs[i])) revert BadAttestation(i);
-            playerCards[i] = values[i];
-        }
-
-        uint256[] memory upAndHole = new uint256[](2);
-        if (!e.verifyDecryption(h.dealerUp, values[pLen], sigs[pLen])) revert BadAttestation(pLen);
-        upAndHole[0] = values[pLen];
-        if (!e.verifyDecryption(h.dealerHole, values[pLen + 1], sigs[pLen + 1])) {
-            revert BadAttestation(pLen + 1);
-        }
-        upAndHole[1] = values[pLen + 1];
-
-        uint256 dLen = h.dealerDraws.length;
-        uint256[] memory draws = new uint256[](dLen);
-        for (uint256 i = 0; i < dLen; i++) {
-            uint256 k = pLen + 2 + i;
-            if (!e.verifyDecryption(h.dealerDraws[i], values[k], sigs[k])) revert BadAttestation(k);
-            draws[i] = values[k];
-        }
+        // Permissionless on purpose. e.verifyDecryption binds every value to its
+        // stored handle, so a caller cannot substitute anything; they can only
+        // submit correct attestations. Restricting this to player-or-keeper made
+        // the timeout reachable whenever the keeper was down and the player
+        // simply declined to settle, which a losing player would always do.
+        (
+            uint256[] memory playerCards,
+            uint256[] memory upAndHole,
+            uint256[] memory draws
+        ) = _resolveCardValues(h, values, sigs);
 
         (BlackjackMath.Outcome outcome, uint8 pTotal, uint8 dTotal, ) = BlackjackMath.settle(
             playerCards,
-            pLen,
+            playerCards.length,
             upAndHole,
             draws,
             hitSoft17
@@ -344,6 +341,124 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
         activeHandOf[h.player] = 0;
 
         _payout(handId, h, outcome, pTotal, dTotal);
+    }
+
+    /// @dev THE MODE BOUNDARY.
+    ///
+    ///      This is the only function in the settle path that knows attestations
+    ///      exist. Everything downstream, BlackjackMath and _payout and the vault,
+    ///      works on plaintext and does not care where it came from.
+    ///
+    ///      If the covalidator proves unreliable and we fall back to commit-reveal,
+    ///      this function is what gets replaced: hash preimages against stored
+    ///      commitments instead of verifying signatures against stored handles.
+    ///      Nothing else in the resolution path changes. That is deliberate, and
+    ///      it is why the indirection exists even though there is currently one
+    ///      implementation.
+    function _resolveCardValues(
+        Hand storage h,
+        uint256[] calldata values,
+        bytes[][] calldata sigs
+    )
+        private
+        view
+        returns (uint256[] memory playerCards, uint256[] memory upAndHole, uint256[] memory draws)
+    {
+        uint256 pLen = h.playerCards.length;
+        uint256 dLen = h.dealerDraws.length;
+        uint256 expected = pLen + 2 + dLen;
+        if (values.length != expected || sigs.length != expected) {
+            revert AttestationCountMismatch(expected, values.length);
+        }
+
+        playerCards = new uint256[](pLen);
+        for (uint256 i = 0; i < pLen; i++) {
+            if (!e.verifyDecryption(h.playerCards[i], values[i], sigs[i])) revert BadAttestation(i);
+            playerCards[i] = values[i];
+        }
+
+        upAndHole = new uint256[](2);
+        if (!e.verifyDecryption(h.dealerUp, values[pLen], sigs[pLen])) revert BadAttestation(pLen);
+        upAndHole[0] = values[pLen];
+        if (!e.verifyDecryption(h.dealerHole, values[pLen + 1], sigs[pLen + 1])) {
+            revert BadAttestation(pLen + 1);
+        }
+        upAndHole[1] = values[pLen + 1];
+
+        draws = new uint256[](dLen);
+        for (uint256 i = 0; i < dLen; i++) {
+            uint256 k = pLen + 2 + i;
+            if (!e.verifyDecryption(h.dealerDraws[i], values[k], sigs[k])) revert BadAttestation(k);
+            draws[i] = values[k];
+        }
+    }
+
+    // ------------------------------------------------------------------ timeout
+
+    /// @notice When the hand timeout is reachable. Zero means not yet.
+    /// @dev Two deadlines, whichever is earlier:
+    ///
+    ///      standAt + attestationTimeout   the ordinary case, attestations never came
+    ///      drawingTime - pushDeadline     the guarantee
+    ///
+    ///      The second term is what makes the timeout safe. Tickets are bound to a
+    ///      drawing and worth nothing after it, so a push that returns expired
+    ///      tickets is not a push. This fires before the drawing regardless of when
+    ///      the hand opened.
+    function timeoutAt(uint256 handId) public view returns (uint256) {
+        Hand storage h = _hands[handId];
+        if (h.state != State.AwaitingAttestation) return 0;
+
+        uint256 byInterval = uint256(h.stoodAt) + attestationTimeoutSeconds;
+        uint256 drawingTime = jackpot.getDrawingState(jackpot.currentDrawingId()).drawingTime;
+        uint256 byDrawing = drawingTime > pushDeadlineSeconds ? drawingTime - pushDeadlineSeconds : 0;
+
+        return byInterval < byDrawing ? byInterval : byDrawing;
+    }
+
+    /// @notice Force a stuck hand to push. Permissionless.
+    ///
+    /// @dev Only reachable when nobody can settle, which in practice means
+    ///      attestations are unobtainable. Anyone holding valid attestations can
+    ///      settle instead, and settle is open to any caller, so this cannot be
+    ///      used to escape a losing hand while the covalidator is healthy.
+    ///
+    ///      Push returns each side its own, per the standing rule. Past the
+    ///      drawing, tickets are worthless, so the player's share settles in USDC
+    ///      at the standing bid instead.
+    function timeoutPush(uint256 handId) external nonReentrant {
+        Hand storage h = _hands[handId];
+        if (h.state != State.AwaitingAttestation) revert WrongState();
+
+        uint256 deadline = timeoutAt(handId);
+        if (deadline == 0 || block.timestamp < deadline) revert TimeoutNotReached(deadline);
+
+        h.state = State.Settled;
+        activeHandOf[h.player] = 0;
+
+        uint256 own = h.playerCards.length;
+        if (own > h.potTickets.length) own = h.potTickets.length;
+
+        uint256 drawingTime = jackpot.getDrawingState(jackpot.currentDrawingId()).drawingTime;
+        uint256 usdcPaid;
+
+        if (block.timestamp >= drawingTime) {
+            // The tickets in the pot belong to a drawing that has already fired.
+            // Returning them would be returning worthless paper.
+            vault.settleInUsdc(h.player, own);
+            usdcPaid = own * vault.settlementPriceUsdc();
+        } else {
+            _release(h, own);
+        }
+
+        if (h.reservedUsdc > 0) {
+            vault.unreserve(h.reservedUsdc);
+            h.reservedUsdc = 0;
+        }
+        h.houseOwedTickets = 0;
+
+        emit HandTimedOut(handId, h.player, own, usdcPaid);
+        emit HandSettled(handId, h.player, BlackjackMath.Outcome.Push, 0, 0, own, usdcPaid);
     }
 
     /// @dev Payout is deliberately separated so the outcome logic above stays
@@ -378,9 +493,38 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
             ticketsToPlayer = h.potTickets.length;
             _release(h, ticketsToPlayer);
             usdcToPlayer = _settleOwed(h);
+
+            if (outcome == BlackjackMath.Outcome.PlayerNatural) {
+                usdcToPlayer += _payNaturalPremium(h);
+            }
         }
 
         emit HandSettled(handId, h.player, outcome, pTotal, dTotal, ticketsToPlayer, usdcToPlayer);
+    }
+
+    /// @dev A natural pays 6:5 rather than 1:1, so the player is owed a fifth of
+    ///      their stake beyond the pot. Ticket NFTs are indivisible, so that
+    ///      fraction settles in USDC through the shared helper.
+    ///
+    ///      Worked: staked 2, winnings 2 * 6/5 = 2.4. The pot already covers 2 of
+    ///      those plus their own 2 back. Outstanding is 0.4, which is $0.40.
+    ///      Naturals are two-card by definition so the stake is always 2, but the
+    ///      helper is general and is not a special case for this rule.
+    function _payNaturalPremium(Hand storage h) private returns (uint256) {
+        uint256 stake = h.playerCards.length;
+        (uint256 extraTickets, uint256 remainder) = TicketMath.splitFractional(
+            stake, // stake * (6/5 - 1) == stake / 5
+            5,
+            vault.ticketPriceUsdc()
+        );
+
+        // A whole extra ticket only arises for stakes of 5 or more, which a
+        // two-card natural cannot reach. Pay it in cash rather than buying a
+        // ticket mid-settle, so the path stays identical whether or not the
+        // drawing is still open.
+        uint256 total = remainder + extraTickets * vault.ticketPriceUsdc();
+        if (total > 0) vault.payUsdc(h.player, total);
+        return total;
     }
 
     function _release(Hand storage h, uint256 count) private {
@@ -463,6 +607,17 @@ contract BlackjackTable is Ownable2Step, ReentrancyGuard {
     function setHitSoft17(bool v) external onlyOwner {
         hitSoft17 = v;
         emit HitSoft17Set(v);
+    }
+
+    /// @dev pushDeadline must stay under the vault's closeBufferSeconds, else a
+    ///      hand could open after the point where stuck hands are already being
+    ///      pushed, which would let a hand exist with no route to resolution.
+    function setTimeoutParams(uint256 attestationTimeout, uint256 pushDeadline) external onlyOwner {
+        uint256 closeBuffer = vault.closeBufferSeconds();
+        if (pushDeadline >= closeBuffer) revert PushDeadlineTooLarge(pushDeadline, closeBuffer);
+        attestationTimeoutSeconds = attestationTimeout;
+        pushDeadlineSeconds = pushDeadline;
+        emit TimeoutParamsSet(attestationTimeout, pushDeadline);
     }
 
     // ----------------------------------------------------------------- internal
